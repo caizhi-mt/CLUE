@@ -44,6 +44,7 @@ from processors import collate_fn,xlnet_collate_fn
 from tools.common import seed_everything
 from tools.common import init_logger,logger
 from tools.progressbar import ProgressBar
+import horovod.torch as hvd
 
 
 ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, XLNetConfig,
@@ -59,7 +60,8 @@ MODEL_CLASSES = {
 def train(args, train_dataset, model, tokenizer):
     """ Train the model """
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    #train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=hvd.size(), rank=hvd.rank(), shuffle=True)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size,collate_fn=xlnet_collate_fn if args.model_type in ['xlnet'] else collate_fn)
 
     if args.max_steps > 0:
@@ -75,23 +77,24 @@ def train(args, train_dataset, model, tokenizer):
         {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
         ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
+    optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
     scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
-    if args.fp16:
-        try:
-            from apex import amp
-        except ImportError:
-            raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
-        model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
+    #if args.fp16:
+    #    try:
+    #        from apex import amp
+    #    except ImportError:
+    #        raise ImportError("Please install apex from https://www.github.com/nvidia/apex to use fp16 training.")
+    #    model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
-    # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
-        model = torch.nn.DataParallel(model)
+    ## multi-gpu training (should be after apex fp16 initialization)
+    #if args.n_gpu > 1:
+    #    model = torch.nn.DataParallel(model)
 
-    # Distributed training (should be after apex fp16 initialization)
-    if args.local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
-                                                          output_device=args.local_rank,
-                                                          find_unused_parameters=True)
+    ## Distributed training (should be after apex fp16 initialization)
+    #if args.local_rank != -1:
+    #    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.local_rank],
+    #                                                      output_device=args.local_rank,
+    #                                                      find_unused_parameters=True)
 
     # Train!
     logger.info("***** Running training *****")
@@ -103,11 +106,15 @@ def train(args, train_dataset, model, tokenizer):
     logger.info("  Gradient Accumulation steps = %d", args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
+    model_without_ddp = model
     global_step = 0
     tr_loss, logging_loss = 0.0, 0.0
     model.zero_grad()
     seed_everything(args.seed)  # Added here for reproductibility (even between python 2 and 3)
-    for _ in range(int(args.num_train_epochs)):
+    hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+    hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+    for epoch_idx in range(int(args.num_train_epochs)):
+        train_dataloader.sampler.set_epoch(epoch_idx)
         pbar = ProgressBar(n_total=len(train_dataloader),desc='Training')
         for step, batch in enumerate(train_dataloader):
             model.train()
@@ -120,32 +127,47 @@ def train(args, train_dataset, model, tokenizer):
             outputs = model(**inputs)
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
-            if args.n_gpu > 1:
-                loss = loss.mean() # mean() to average on multi-gpu parallel training
-            if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+            #if args.n_gpu > 1:
+            #    loss = loss.mean() # mean() to average on multi-gpu parallel training
+            #if args.gradient_accumulation_steps > 1:
+            #    loss = loss / args.gradient_accumulation_steps
 
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
+                    optimizer.synchronize()
                 torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
             else:
                 loss.backward()
+                optimizer.synchronize()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
 
+            has_nan = False
+            for n, p in model.named_parameters():
+                if p.grad is not None:
+                    if torch.any(torch.isnan(p.grad)):
+                        has_nan = True
+                        break
+                    if torch.any(p.grad > 50):
+                        has_nan = True
+                        break
+                    if has_nan:
+                        optimizer.zero_grad()
             tr_loss += loss.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
-                optimizer.step()
+                with optimizer.skip_synchronize():
+                    if not has_nan:
+                        optimizer.step()
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
 
-                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    # Log metrics
-                    if args.local_rank == -1 :  # Only evaluate when single GPU otherwise metrics may not average well
-                        results = evaluate(args, model, tokenizer)
+                #if  [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                #    # Log metrics
+                #    if args.local_rank == -1 :  # Only evaluate when single GPU otherwise metrics may not average well
+                #        results = evaluate(args, model, tokenizer)
 
-                if args.local_rank in [-1, 0] and args.save_steps > 0 and global_step % args.save_steps == 0:
+                if hvd.rank() == 0 and args.save_steps > 0 and global_step % args.save_steps == 0:
                     # Save model checkpoint
                     output_dir = os.path.join(args.output_dir, 'checkpoint-{}'.format(global_step))
                     if not os.path.exists(output_dir):
@@ -157,9 +179,16 @@ def train(args, train_dataset, model, tokenizer):
                     tokenizer.save_vocabulary(vocab_path=output_dir)
             pbar(step,{'loss':loss.item()})
         print(" ")
-        if 'cuda' in str(args.device):
-            torch.cuda.empty_cache()
+        results = evaluate(args, model, tokenizer)
+        #if 'cuda' in str(args.device):
+        #    torch.cuda.empty_cache()
     return global_step, tr_loss / global_step
+
+##### Validation
+def reduce_tensor_hvd(tensor):
+    rt = tensor.clone()
+    avg_rt = hvd.allreduce(rt)
+    return avg_rt
 
 def evaluate(args, model, tokenizer, prefix=""):
     # Loop to handle MNLI double evaluation (matched, mis-matched)
@@ -174,7 +203,7 @@ def evaluate(args, model, tokenizer, prefix=""):
 
         args.eval_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
         # Note that DistributedSampler samples randomly
-        eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
+        eval_sampler = DistributedSampler(eval_dataset, num_replicas=hvd.size(), rank=hvd.rank(), shuffle=False)
         eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.eval_batch_size,collate_fn=xlnet_collate_fn if args.model_type in ['xlnet'] else collate_fn)
 
         # Eval!
@@ -218,7 +247,10 @@ def evaluate(args, model, tokenizer, prefix=""):
         results.update(result)
         logger.info("***** Eval results {} *****".format(prefix))
         for key in sorted(result.keys()):
-            logger.info("  %s = %s", key, str(result[key]))
+            acc = torch.tensor(result[key])
+            acc = reduce_tensor_hvd(acc)
+            results["acc"] = acc.cpu().numpy()
+            logger.info("  %s = %s", key, acc.cpu())
     return results
 
 def predict(args, model, tokenizer, prefix=""):
@@ -333,15 +365,17 @@ def main():
     parser = argparse.ArgumentParser()
 
     ## Required parameters
-    parser.add_argument("--data_dir", default=None, type=str, required=True,
+    parser.add_argument("--data_dir", default="./chineseGLUEdatasets/tnews/", type=str,
                         help="The input data dir. Should contain the .tsv files (or other data files) for the task.")
-    parser.add_argument("--model_type", default=None, type=str, required=True,
+    parser.add_argument("--model_type", default="bert", type=str, 
                         help="Model type selected in the list: " + ", ".join(MODEL_CLASSES.keys()))
-    parser.add_argument("--model_name_or_path", default=None, type=str, required=True,
+    parser.add_argument("--model_name_or_path", default="bert-base-chinese", type=str, 
                         help="Path to pre-trained model or shortcut name selected in the list: " + ", ".join(ALL_MODELS))
-    parser.add_argument("--task_name", default=None, type=str, required=True,
+    parser.add_argument("--task_name", default="tnews", type=str,
                         help="The name of the task to train selected in the list: " + ", ".join(processors.keys()))
-    parser.add_argument("--output_dir", default=None, type=str, required=True,
+    parser.add_argument("--device", default="mtgpu", type=str,
+                        help="device")
+    parser.add_argument("--output_dir", default="./outputs/tnews_output", type=str,
                         help="The output directory where the model predictions and checkpoints will be written.")
 
     ## Other parameters
@@ -354,22 +388,22 @@ def main():
     parser.add_argument("--max_seq_length", default=128, type=int,
                         help="The maximum total input sequence length after tokenization. Sequences longer "
                              "than this will be truncated, sequences shorter will be padded.")
-    parser.add_argument("--do_train", action='store_true',
+    parser.add_argument("--do_train", default=True,
                         help="Whether to run training.")
-    parser.add_argument("--do_eval", action='store_true',
+    parser.add_argument("--do_eval", default=True,
                         help="Whether to run eval on the dev set.")
     parser.add_argument("--do_predict", action='store_true',
                         help="Whether to run the model in inference mode on the test set.")
-    parser.add_argument("--do_lower_case", action='store_true',
+    parser.add_argument("--do_lower_case", default=True,
                         help="Set this flag if you are using an uncased model.")
 
-    parser.add_argument("--per_gpu_train_batch_size", default=8, type=int,
+    parser.add_argument("--per_gpu_train_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for training.")
-    parser.add_argument("--per_gpu_eval_batch_size", default=8, type=int,
+    parser.add_argument("--per_gpu_eval_batch_size", default=4, type=int,
                         help="Batch size per GPU/CPU for evaluation.")
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
-    parser.add_argument("--learning_rate", default=5e-5, type=float,
+    parser.add_argument("--learning_rate", default=2e-5, type=float,
                         help="The initial learning rate for Adam.")
     parser.add_argument("--weight_decay", default=0.01, type=float,
                         help="Weight deay if we apply some.")
@@ -377,22 +411,22 @@ def main():
                         help="Epsilon for Adam optimizer.")
     parser.add_argument("--max_grad_norm", default=1.0, type=float,
                         help="Max gradient norm.")
-    parser.add_argument("--num_train_epochs", default=3.0, type=float,
+    parser.add_argument("--num_train_epochs", default=4.0, type=float,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--max_steps", default=-1, type=int,
                         help="If > 0: set total number of training steps to perform. Override num_train_epochs.")
     parser.add_argument("--warmup_proportion", default=0.1, type=float,
                         help="Proportion of training to perform linear learning rate warmup for,E.g., 0.1 = 10% of training.")
 
-    parser.add_argument('--logging_steps', type=int, default=10,
+    parser.add_argument('--logging_steps', type=int, default=8372,
                         help="Log every X updates steps.")
-    parser.add_argument('--save_steps', type=int, default=1000,
+    parser.add_argument('--save_steps', type=int, default=8372,
                         help="Save checkpoint every X updates steps.")
     parser.add_argument("--eval_all_checkpoints", action='store_true',
                         help="Evaluate all checkpoints starting with the same prefix as model_name ending and ending with step number")
     parser.add_argument("--no_cuda", action='store_true',
                         help="Avoid using CUDA when available")
-    parser.add_argument('--overwrite_output_dir', action='store_true',
+    parser.add_argument('--overwrite_output_dir', default=True,
                         help="Overwrite the content of the output directory")
     parser.add_argument('--overwrite_cache', action='store_true',
                         help="Overwrite the cached training and evaluation sets")
@@ -425,16 +459,23 @@ def main():
         ptvsd.enable_attach(address=(args.server_ip, args.server_port), redirect_output=True)
         ptvsd.wait_for_attach()
 
-    # Setup CUDA, GPU & distributed training
-    if args.local_rank == -1 or args.no_cuda:
-        device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-        args.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
-        torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
-        torch.distributed.init_process_group(backend='nccl')
-        args.n_gpu = 1
-    args.device = device
+    ## Setup CUDA, GPU & distributed training
+    #if args.local_rank == -1 or args.no_cuda:
+    #    device = torch.device("cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+    #    args.n_gpu = torch.cuda.device_count()
+    #else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+    #    torch.cuda.set_device(args.local_rank)
+    #    device = torch.device("cuda", args.local_rank)
+    #    torch.distributed.init_process_group(backend='nccl')
+    #    args.n_gpu = 1
+    hvd.init()
+    args.n_gpu = hvd.size()
+    device=args.device
+    if args.device == "mtgpu":
+        os.environ["PVR_GPUIDX"] = str(hvd.local_rank())
+        #os.environ["MTGPU_MAX_MEM_USAGE_GB"] = "14"
+        import musa_torch_extension
+
 
     # Setup logging
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
@@ -476,9 +517,9 @@ def main():
 
 
     # Saving best-practices: if you use defaults names for the model, you can reload it using from_pretrained()
-    if args.do_train and (args.local_rank == -1 or torch.distributed.get_rank() == 0):
+    if args.do_train and hvd.rank() == 0:
         # Create output directory if needed
-        if not os.path.exists(args.output_dir) and args.local_rank in [-1, 0]:
+        if not os.path.exists(args.output_dir) and hvd.rank() == 0:
             os.makedirs(args.output_dir)
 
         logger.info("Saving model checkpoint to %s", args.output_dir)
